@@ -1,260 +1,417 @@
 #!/usr/bin/env python3
-"""Draw the 21 November 2026 world-news front page (1024x1024 PNG).
+"""Render the front page for 21 November 2026: "The World in One Day".
 
-A newspaper-style infographic: a navy masthead naming the day, six
-verified stories of Saturday 21 November 2026 in a 2x3 card grid (each
-with a tag, a headline, a one-line summary, a flat pictogram and a
-dateline), an "also today" strip with five more headlines, and a footer
-with sources. Drawn from scratch with Pillow and DejaVu Sans; no copied
-art, no network. Palette and pictograms are new for this edition.
+Draws a single 1024x1024 newspaper front page with Pillow. Six lead
+stories in a hero + grid + wide-band layout, an "Also today" strip with
+five more items, and a navy masthead and footer. Deterministic: no
+randomness, no clock, no network — the same input always produces the
+same bytes.
+
+Usage:  python3 render.py [output-path]
+Default output is news.png next to this script.
 """
-import math
+
+import os
+import sys
 
 from PIL import Image, ImageDraw, ImageFont
 
-W, H = 1024, 1024
-OUT = "news.png"
+# ---------------------------------------------------------------- canvas
 
-BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-REG = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+PAGE_W = 1024
+PAGE_H = 1024
+MARGIN = 24
 
-PAPER = (250, 248, 243)
-INK = (22, 22, 22)
-SOFT = (72, 72, 72)
-NAVY = (13, 27, 62)
-NAVY_SOFT = (148, 163, 196)
-AMBER = (226, 135, 32)
-CRIMSON = (164, 30, 34)
-CARD = (255, 255, 255)
-EDGE = (222, 216, 200)
+PAPER = (246, 243, 236)      # warm off-white page
+CARD = (255, 255, 255)       # story cards
+INK = (24, 28, 38)           # near-black text
+MUTED = (92, 96, 104)        # deck grey
+NAVY = (22, 35, 63)          # masthead / footer
+NAVY_SOFT = (148, 166, 198)    # masthead secondary text
+RED = (178, 34, 34)          # war red / rule
+AMBER = (176, 106, 12)       # markets amber
+TEAL = (14, 116, 110)        # deal teal
+BLUE = (37, 82, 160)         # climate blue
+PURPLE = (109, 72, 170)      # cyber purple
+GREEN = (28, 122, 80)        # missile green
+ORANGE = (245, 158, 11)      # Saturday accent
+DISC_INK = (255, 255, 255)   # glyphs drawn on coloured discs
+
+# ------------------------------------------------------------- fonts
+
+_FONT_DIRS = [
+    "/usr/share/fonts/truetype/dejavu",
+    "/usr/share/fonts/truetype/liberation",
+    "/usr/share/fonts/truetype/noto",
+]
+
+_BOLD_NAMES = ["DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf",
+               "NotoSans-Bold.ttf"]
+_REG_NAMES = ["DejaVuSans.ttf", "LiberationSans-Regular.ttf",
+              "NotoSans-Regular.ttf"]
 
 
-def load(path, size):
-    return ImageFont.truetype(path, size)
+def _find_font(names):
+    """First existing file from the candidate font names, or None."""
+    for directory in _FONT_DIRS:
+        for name in names:
+            path = os.path.join(directory, name)
+            if os.path.isfile(path):
+                return path
+    return None
 
 
-def wrap_text(text, face, max_w):
-    """Greedy word wrap: lines that fit max_w pixels."""
-    out, cur = [], ""
-    for word in text.split():
-        trial = (cur + " " + word).strip()
-        if face.getlength(trial) <= max_w:
-            cur = trial
+def load_fonts():
+    """Return (bold, regular) font factories: size -> ImageFont."""
+    bold_path = _find_font(_BOLD_NAMES)
+    reg_path = _find_font(_REG_NAMES)
+    cache = {}
+
+    def make(path, size, fallback):
+        key = (path, size)
+        if key not in cache:
+            if path is not None:
+                cache[key] = ImageFont.truetype(path, size)
+            else:
+                cache[key] = fallback
+        return cache[key]
+
+    default = ImageFont.load_default()
+    return (
+        lambda size: make(bold_path, size, default),
+        lambda size: make(reg_path, size, default),
+    )
+
+
+BOLD, REG = load_fonts()
+
+# ------------------------------------------------------------- helpers
+
+
+def wrap(draw, text, font, max_width):
+    """Greedy word wrap; returns a list of lines fitting max_width."""
+    words = text.split()
+    lines = []
+    current = ""
+    for word in words:
+        trial = word if not current else current + " " + word
+        if draw.textlength(trial, font=font) <= max_width:
+            current = trial
         else:
-            if cur:
-                out.append(cur)
-            cur = word
-    if cur:
-        out.append(cur)
-    return out
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
 
 
-def tint(color, frac=0.15):
-    """Tint a color toward white."""
-    return tuple(int(c + (255 - c) * frac) for c in color)
+def draw_lines(draw, x, y, lines, font, fill, leading):
+    """Draw stacked lines; returns the y just below the last line."""
+    for line in lines:
+        draw.text((x, y), line, font=font, fill=fill)
+        y += leading
+    return y
 
 
-def pictogram(d, kind, cx, cy, r, color):
-    """Flat pictogram inside a tinted disc; one drawing per story kind."""
-    d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=tint(color, 0.16))
-    s = r * 0.6
-    if kind == "missile":
-        # cruise missile flying up-right, with a flame trail
-        d.line([cx - s * 0.9, cy + s * 0.9, cx - s * 0.3, cy + s * 0.3],
-               fill=(226, 135, 32), width=7)
-        d.polygon([(cx - s * 0.55, cy + s * 0.75), (cx + s * 0.25, cy - s * 0.05),
-                   (cx + s * 0.05, cy - s * 0.25), (cx + s * 0.75, cy - s * 0.55)],
-                  fill=color)
-        d.polygon([(cx - s * 0.15, cy + s * 0.35), (cx + s * 0.45, cy + s * 0.95),
-                   (cx + s * 0.75, cy + s * 0.45)], fill=color)
-        d.ellipse([cx + s * 0.5, cy - s * 0.75, cx + s * 0.85, cy - s * 0.4],
-                  fill=color)
-    elif kind == "chart":
-        # falling line chart: axes, a jagged down-trend and an arrow
-        d.line([cx - s * 0.8, cy + s * 0.8, cx + s * 0.9, cy + s * 0.8],
-               fill=color, width=4)
-        d.line([cx - s * 0.8, cy + s * 0.8, cx - s * 0.8, cy - s * 0.8],
-               fill=color, width=4)
-        pts = [(cx - s * 0.7, cy - s * 0.55), (cx - s * 0.35, cy - s * 0.2),
-               (cx, cy - s * 0.45), (cx + s * 0.35, cy + s * 0.15),
-               (cx + s * 0.7, cy + s * 0.55)]
-        d.line(pts, fill=color, width=6, joint="curve")
-        d.polygon([(cx + s * 0.7, cy + s * 0.55), (cx + s * 0.42, cy + s * 0.55),
-                   (cx + s * 0.7, cy + s * 0.83)], fill=color)
-    elif kind == "bridge":
-        # suspension bridge: two towers, a sagging cable and a deck
-        d.line([cx - s * 0.6, cy - s * 0.6, cx - s * 0.6, cy + s * 0.8],
-               fill=color, width=6)
-        d.line([cx + s * 0.6, cy - s * 0.6, cx + s * 0.6, cy + s * 0.8],
-               fill=color, width=6)
-        d.arc([cx - s * 0.6, cy - s * 1.1, cx + s * 0.6, cy + s * 0.5],
-              0, 180, fill=color, width=5)
-        d.line([cx - s * 0.9, cy + s * 0.55, cx + s * 0.9, cy + s * 0.55],
-               fill=color, width=6)
-        for dx in (-0.45, -0.15, 0.15, 0.45):
-            d.line([cx + dx * s, cy + s * 0.15, cx + dx * s, cy + s * 0.55],
-                   fill=color, width=3)
-    elif kind == "globe":
-        # planet: circle outline, meridian arcs and a polar cap
-        d.ellipse([cx - s * 0.8, cy - s * 0.8, cx + s * 0.8, cy + s * 0.8],
-                  outline=color, width=5)
-        d.arc([cx - s * 0.35, cy - s * 0.8, cx + s * 0.35, cy + s * 0.8],
-              270, 90, fill=color, width=4)
-        d.arc([cx - s * 0.35, cy - s * 0.8, cx + s * 0.35, cy + s * 0.8],
-              90, 270, fill=color, width=4)
-        d.line([cx - s * 0.8, cy, cx + s * 0.8, cy], fill=color, width=4)
-        d.arc([cx - s * 0.8, cy - s * 0.8, cx + s * 0.8, cy + s * 0.8],
-              200, 340, fill=color, width=4)
-    elif kind == "padlock":
-        # padlock: shackle arc, body and keyhole
-        d.arc([cx - s * 0.45, cy - s * 0.85, cx + s * 0.45, cy + s * 0.05],
-              180, 360, fill=color, width=7)
-        d.rounded_rectangle([cx - s * 0.62, cy - s * 0.25, cx + s * 0.62,
-                             cy + s * 0.75], radius=8, fill=color)
-        d.ellipse([cx - 5, cy - s * 0.02, cx + 5, cy + s * 0.08], fill=(255, 255, 255))
-        d.polygon([(cx - 4, cy + s * 0.05), (cx + 4, cy + s * 0.05),
-                   (cx + 7, cy + s * 0.4), (cx - 7, cy + s * 0.4)],
-                  fill=(255, 255, 255))
-    elif kind == "dome":
-        # missile-defence dome: wide arc over a skyline, three
-        # intercepted missiles marked with crosses
-        d.arc([cx - s * 0.95, cy - s * 0.55, cx + s * 0.95, cy + s * 0.95],
-              180, 360, fill=color, width=7)
-        for dx, w in [(-0.52, 0.3), (0.0, 0.42), (0.52, 0.32)]:
-            d.rectangle([cx + dx * s - w * s / 2, cy + s * 0.5,
-                         cx + dx * s + w * s / 2, cy + s * 0.85], fill=color)
-        for dx, dy in [(-0.55, -0.62), (0.05, -0.78), (0.6, -0.55)]:
-            px, py = cx + dx * s, cy + dy * s
-            d.ellipse([px - 8, py - 8, px + 8, py + 8], fill=color)
-            d.line([px - 4, py - 4, px + 4, py + 4], fill=(255, 255, 255),
-                   width=3)
-            d.line([px - 4, py + 4, px + 4, py - 4], fill=(255, 255, 255),
-                   width=3)
+def tag_pill(draw, x, y, label, bg, fg=DISC_INK, size=15, pad_x=10, pad_y=5):
+    """A small rounded tag; returns its width."""
+    font = BOLD(size)
+    w = int(draw.textlength(label, font=font)) + 2 * pad_x
+    h = size + 2 * pad_y
+    draw.rounded_rectangle([x, y, x + w, y + h], radius=h // 2, fill=bg)
+    draw.text((x + pad_x, y + pad_y - 1), label, font=font, fill=fg)
+    return w
 
 
-# tag, accent colour, pictogram, headline, summary, dateline
-STORIES = [
-    {"tag": "WAR", "color": (164, 30, 34), "icon": "missile",
-     "headline": "Russia strikes Ukraine; missiles hit Poland",
-     "summary": "400+ drones and 110 missiles kill 8 in Kyiv; Tusk calls it a provocation.",
-     "dateline": "KYIV & POLAND"},
-    {"tag": "MARKETS", "color": (176, 106, 18), "icon": "chart",
-     "headline": "AI rout drags S&P 500 into correction",
-     "summary": "S&P falls 3.7% for a seventh straight loss; Nasdaq wipes out 2026 gains.",
-     "dateline": "NEW YORK, USA"},
-    {"tag": "DEAL", "color": (14, 110, 110), "icon": "bridge",
-     "headline": "UK and EU seal biggest post-Brexit deal",
-     "summary": "Food trade, carbon markets and youth mobility for 100,000 agreed.",
-     "dateline": "BRUSSELS, BELGIUM"},
-    {"tag": "CLIMATE", "color": (38, 92, 158), "icon": "globe",
-     "headline": "COP31 runs into overtime over fossil fuels",
-     "summary": "Draft drops every mention of fossil fuels; talks get an extra day.",
-     "dateline": "ANTALYA, TURKEY"},
-    {"tag": "CYBER", "color": (104, 72, 160), "icon": "padlock",
-     "headline": "FBI crime database hacked, CNN reports",
-     "summary": "National Crime Information Center breached; second FBI hack in months.",
-     "dateline": "WASHINGTON, USA"},
-    {"tag": "MISSILE", "color": (34, 112, 74), "icon": "dome",
-     "headline": "Saudi defences down three Houthi missiles",
-     "summary": "Third straight night of alerts over Riyadh; no casualties reported.",
-     "dateline": "RIYADH, SAUDI ARABIA"},
-]
-
-ALSO_TODAY = [
-    "Peru 6.9 quake shakes Andes, felt in Lima",
-    "Anthropic shares fall 8.5% on day two after IPO",
-    "Trump calls Putin \u2018my friend\u2019; Zelensky: \u2018killer\u2019",
-    "Gen Z protests spread across 25 European nations",
-    "Bayer pays $7.25bn to settle Roundup claims",
-]
+def disc(draw, cx, cy, radius, color):
+    """A solid coloured disc used as the backdrop for an icon glyph."""
+    draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius],
+                 fill=color)
 
 
-def draw_card(d, story, x, y, bw, bh):
-    color = story["color"]
-    d.rounded_rectangle([x, y, x + bw, y + bh], radius=12, fill=CARD,
-                        outline=EDGE, width=1)
-    # accent bar across the top of the card
-    d.rounded_rectangle([x, y, x + bw, y + 6], radius=3, fill=color)
-    f_tag = load(BOLD, 18)
-    f_head = load(BOLD, 26)
-    f_sum = load(REG, 21)
-    f_date = load(BOLD, 14)
-    # tag chip
-    tw = f_tag.getlength(story["tag"]) + 20
-    d.rounded_rectangle([x + 18, y + 18, x + 18 + tw, y + 18 + 26],
-                        radius=6, fill=color)
-    d.text((x + 28, y + 22), story["tag"], font=f_tag, fill=(255, 255, 255))
-    # pictogram, top right
-    pictogram(d, story["icon"], x + bw - 62, y + 60, 44, color)
-    # headline, left of the pictogram, at most two lines
-    lines = wrap_text(story["headline"], f_head, bw - 36 - 100)[:2]
-    hy = y + 56
-    for ln in lines:
-        d.text((x + 18, hy), ln, font=f_head, fill=INK)
-        hy += 33
-    # summary, full width, at most two lines
-    slines = wrap_text(story["summary"], f_sum, bw - 36)[:2]
-    sy = y + 56 + 2 * 33 + 8
-    for ln in slines:
-        d.text((x + 18, sy), ln, font=f_sum, fill=SOFT)
-        sy += 27
-    # dateline at the bottom
-    d.text((x + 18, y + bh - 28), story["dateline"], font=f_date, fill=color)
+# ------------------------------------------------------------- icons
+# Each glyph is drawn with plain Pillow primitives on its disc. All
+# coordinates are relative to the disc centre (cx, cy) and radius r.
+
+
+def icon_burst(draw, cx, cy, r):
+    """War: a burst of radiating lines from a solid centre."""
+    k = DISC_INK
+    draw.ellipse([cx - r * 0.22, cy - r * 0.22, cx + r * 0.22, cy + r * 0.22],
+                 fill=k)
+    for angle in range(0, 360, 30):
+        import math
+        a = math.radians(angle)
+        x0 = cx + int(math.cos(a) * r * 0.34)
+        y0 = cy + int(math.sin(a) * r * 0.34)
+        x1 = cx + int(math.cos(a) * r * 0.82)
+        y1 = cy + int(math.sin(a) * r * 0.82)
+        draw.line([x0, y0, x1, y1], fill=k, width=max(3, r // 12))
+
+
+def icon_chart(draw, cx, cy, r):
+    """Markets: a falling line chart with an arrowhead."""
+    k = DISC_INK
+    w = max(4, r // 10)
+    pts = [
+        (cx - r * 0.62, cy - r * 0.30),
+        (cx - r * 0.22, cy + r * 0.05),
+        (cx + r * 0.10, cy - r * 0.15),
+        (cx + r * 0.55, cy + r * 0.45),
+    ]
+    draw.line(pts, fill=k, width=w, joint="curve")
+    tip = pts[-1]
+    draw.polygon([
+        (tip[0] + r * 0.28, tip[1] - r * 0.05),
+        (tip[0] - r * 0.02, tip[1] + r * 0.28),
+        (tip[0] - r * 0.10, tip[1] - r * 0.22),
+    ], fill=k)
+    draw.line([cx - r * 0.62, cy + r * 0.62, cx + r * 0.62, cy + r * 0.62],
+              fill=k, width=max(3, r // 14))
+
+
+def icon_bridge(draw, cx, cy, r):
+    """Deal: a bridge arc on two pillars, crossed by a check."""
+    k = DISC_INK
+    w = max(4, r // 10)
+    draw.arc([cx - r * 0.62, cy - r * 0.55, cx + r * 0.62, cy + r * 0.55],
+             start=180, end=360, fill=k, width=w)
+    draw.line([cx - r * 0.55, cy + r * 0.05, cx - r * 0.55, cy + r * 0.62],
+              fill=k, width=w)
+    draw.line([cx + r * 0.55, cy + r * 0.05, cx + r * 0.55, cy + r * 0.62],
+              fill=k, width=w)
+    draw.line([cx - r * 0.30, cy + r * 0.10, cx - r * 0.05, cy + r * 0.35,
+               cx + r * 0.38, cy - r * 0.28], fill=k, width=w, joint="curve")
+
+
+def icon_globe(draw, cx, cy, r):
+    """Climate: a globe with latitude and longitude arcs."""
+    k = DISC_INK
+    w = max(3, r // 12)
+    draw.ellipse([cx - r * 0.62, cy - r * 0.62, cx + r * 0.62, cy + r * 0.62],
+                 outline=k, width=w)
+    draw.ellipse([cx - r * 0.62, cy - r * 0.22, cx + r * 0.62, cy + r * 0.22],
+                 outline=k, width=max(2, r // 16))
+    draw.arc([cx - r * 0.28, cy - r * 0.62, cx + r * 0.28, cy + r * 0.62],
+             start=270, end=90, fill=k, width=w)
+    draw.arc([cx - r * 0.28, cy - r * 0.62, cx + r * 0.28, cy + r * 0.62],
+             start=90, end=270, fill=k, width=max(2, r // 16))
+
+
+def icon_lock(draw, cx, cy, r):
+    """Cyber: a padlock with a shackle."""
+    k = DISC_INK
+    w = max(4, r // 10)
+    body = [cx - r * 0.42, cy - r * 0.05, cx + r * 0.42, cy + r * 0.55]
+    draw.rounded_rectangle(body, radius=r // 8, fill=k)
+    draw.arc([cx - r * 0.30, cy - r * 0.58, cx + r * 0.30, cy + r * 0.10],
+             start=180, end=360, fill=k, width=w)
+    draw.ellipse([cx - r * 0.07, cy + r * 0.16, cx + r * 0.07, cy + r * 0.30],
+                 fill=NAVY)
+    draw.line([cx, cy + r * 0.26, cx, cy + r * 0.42], fill=NAVY,
+              width=max(3, r // 14))
+
+
+def icon_shield(draw, cx, cy, r):
+    """Missile defence: a shield with a check and two stars."""
+    k = DISC_INK
+    w = max(4, r // 10)
+    pts = [
+        (cx, cy - r * 0.62),
+        (cx + r * 0.55, cy - r * 0.38),
+        (cx + r * 0.55, cy + r * 0.08),
+        (cx, cy + r * 0.62),
+        (cx - r * 0.55, cy + r * 0.08),
+        (cx - r * 0.55, cy - r * 0.38),
+    ]
+    draw.polygon(pts, outline=k, width=w)
+    draw.line([cx - r * 0.26, cy + r * 0.02, cx - r * 0.06, cy + r * 0.22,
+               cx + r * 0.30, cy - r * 0.22], fill=k, width=w, joint="curve")
+    for sx in (-r * 0.30, r * 0.30):
+        draw.text((cx + sx - 4, cy - r * 0.52), "*", font=BOLD(14), fill=k)
+
+
+# ------------------------------------------------------------- cards
+
+
+def story_card(draw, box, tag, color, headline, deck, dateline, icon):
+    """One grid card: tag, headline, deck, dateline, icon disc."""
+    x0, y0, x1, y1 = box
+    draw.rounded_rectangle(box, radius=10, fill=CARD)
+    draw.rectangle([x0 + 10, y0, x1 - 10, y0 + 5], fill=color)
+    tag_pill(draw, x0 + 18, y0 + 16, tag, color)
+    disc(draw, x1 - 48, y0 + 48, 30, color)
+    icon(draw, x1 - 48, y0 + 48, 30)
+    text_w = (x1 - x0) - 36
+    head_lines = wrap(draw, headline, BOLD(23), text_w - 70)
+    y = draw_lines(draw, x0 + 18, y0 + 52, head_lines[:2], BOLD(23), INK, 28)
+    deck_lines = wrap(draw, deck, REG(16), text_w)
+    draw_lines(draw, x0 + 18, y + 4, deck_lines[:2], REG(16), MUTED, 20)
+    draw.text((x0 + 18, y1 - 26), dateline, font=BOLD(13), fill=color)
+
+
+def hero_card(draw, box, tag, color, headline, deck, dateline, icon):
+    """The full-width lead story: big headline, large icon disc."""
+    x0, y0, x1, y1 = box
+    draw.rounded_rectangle(box, radius=10, fill=CARD)
+    draw.rectangle([x0 + 10, y0, x1 - 10, y0 + 6], fill=color)
+    tag_pill(draw, x0 + 20, y0 + 18, tag, color, size=16)
+    disc(draw, x1 - 108, (y0 + y1) // 2, 78, color)
+    icon(draw, x1 - 108, (y0 + y1) // 2, 78)
+    text_w = (x1 - x0) - 260
+    head_lines = wrap(draw, headline, BOLD(38), text_w)
+    y = draw_lines(draw, x0 + 20, y0 + 52, head_lines[:2], BOLD(38), INK, 44)
+    deck_lines = wrap(draw, deck, REG(19), text_w)
+    y = draw_lines(draw, x0 + 20, y + 6, deck_lines[:3], REG(19), MUTED, 25)
+    date_y = min(y + 8, y1 - 24)
+    draw.text((x0 + 20, date_y), dateline, font=BOLD(14), fill=color)
+
+
+def band_card(draw, box, tag, color, headline, deck, dateline, icon):
+    """A wide horizontal card: text on the left, icon on the right."""
+    x0, y0, x1, y1 = box
+    draw.rounded_rectangle(box, radius=10, fill=CARD)
+    draw.rectangle([x0 + 10, y0, x1 - 10, y0 + 5], fill=color)
+    tag_pill(draw, x0 + 18, y0 + 14, tag, color)
+    disc(draw, x1 - 56, (y0 + y1) // 2, 40, color)
+    icon(draw, x1 - 56, (y0 + y1) // 2, 40)
+    text_w = (x1 - x0) - 160
+    head_lines = wrap(draw, headline, BOLD(26), text_w)
+    y = draw_lines(draw, x0 + 18, y0 + 46, head_lines[:1], BOLD(26), INK, 32)
+    deck_lines = wrap(draw, deck, REG(16), text_w - 190)
+    deck_y = y + 2
+    draw_lines(draw, x0 + 18, deck_y, deck_lines[:1], REG(16), MUTED, 21)
+    deck_w = draw.textlength(deck_lines[0], font=REG(16)) if deck_lines else 0
+    draw.text((x0 + 18 + deck_w + 8, deck_y + 1), "— " + dateline,
+              font=BOLD(13), fill=color)
+
+
+# ------------------------------------------------------------- page
+
+
+def masthead(draw):
+    """Navy top band: kicker, date, Saturday, dateline cities, red rule."""
+    draw.rectangle([0, 0, PAGE_W, 128], fill=NAVY)
+    draw.text((MARGIN, 16), "THE WORLD IN ONE DAY",
+              font=BOLD(20), fill=NAVY_SOFT)
+    draw.text((MARGIN, 48), "21 NOVEMBER 2026", font=BOLD(50), fill=CARD)
+    right = "SATURDAY"
+    w = draw.textlength(right, font=BOLD(30))
+    draw.text((PAGE_W - MARGIN - w, 14), right, font=BOLD(30), fill=ORANGE)
+    cities = "KYIV · WARSAW · NEW YORK · BRUSSELS"
+    w2 = draw.textlength(cities, font=REG(15))
+    draw.text((PAGE_W - MARGIN - w2, 56), cities, font=REG(15), fill=NAVY_SOFT)
+    draw.text((PAGE_W - MARGIN - w2, 82), "EDITION Nº 325",
+              font=BOLD(15), fill=CARD)
+    draw.rectangle([0, 128, PAGE_W, 134], fill=RED)
+
+
+def also_today(draw, y0, y1):
+    """The strip of five shorter items under the story grid."""
+    draw.rounded_rectangle([MARGIN, y0, PAGE_W - MARGIN, y1], radius=10,
+                           fill=CARD, outline=(200, 196, 186), width=1)
+    label = "ALSO TODAY — "
+    font = REG(17)
+    x = MARGIN + 16
+    y = y0 + 14
+    draw.text((x, y), label, font=BOLD(17), fill=INK)
+    x += int(draw.textlength(label, font=BOLD(17)))
+    items = [
+        "Peru 6.9 quake shakes Andes, felt in Lima",
+        "Anthropic shares fall 8.5% on day two after IPO",
+        "Trump calls Putin \u2018my friend\u2019; Zelensky: \u2018killer\u2019",
+        "Gen Z protests spread across 25 European nations",
+        "Bayer pays $7.25bn to settle Roundup claims",
+    ]
+    body = "  ·  ".join(items)
+    lines = wrap(draw, body, font, (PAGE_W - MARGIN) - x - 16)
+    draw_lines(draw, x, y, lines[:3], font, INK, 23)
+
+
+def footer(draw):
+    """Navy bottom band: date and sources."""
+    draw.rectangle([0, 962, PAGE_W, PAGE_H], fill=NAVY)
+    draw.text((MARGIN, 972), "21 NOVEMBER 2026", font=BOLD(16), fill=CARD)
+    draw.text((MARGIN, 996),
+              "Sources: Reuters · Associated Press · CNN · BBC News · "
+              "Al Jazeera · AP",
+              font=REG(13), fill=NAVY_SOFT)
+    mark = "THE WORLD IN ONE DAY"
+    w = draw.textlength(mark, font=BOLD(13))
+    draw.text((PAGE_W - MARGIN - w, 978), mark, font=BOLD(13), fill=ORANGE)
+
+
+def build():
+    """Compose the whole page and return the PIL image."""
+    img = Image.new("RGB", (PAGE_W, PAGE_H), PAPER)
+    draw = ImageDraw.Draw(img)
+
+    masthead(draw)
+
+    hero_card(
+        draw, (MARGIN, 146, PAGE_W - MARGIN, 352),
+        "WAR", RED,
+        "Russia strikes Ukraine; missiles hit Poland",
+        "400+ drones and 110 missiles kill 8 in Kyiv; Tusk calls it "
+        "a provocation.",
+        "KYIV & POLAND", icon_burst,
+    )
+
+    story_card(
+        draw, (MARGIN, 366, 494, 546),
+        "MARKETS", AMBER,
+        "AI rout drags S&P 500 into correction",
+        "S&P falls 3.7% for a seventh straight loss; Nasdaq wipes out "
+        "2026 gains.",
+        "NEW YORK, USA", icon_chart,
+    )
+    story_card(
+        draw, (530, 366, PAGE_W - MARGIN, 546),
+        "DEAL", TEAL,
+        "UK and EU seal biggest post-Brexit deal",
+        "Food trade, carbon markets and youth mobility for 100,000 "
+        "agreed.",
+        "BRUSSELS, BELGIUM", icon_bridge,
+    )
+    story_card(
+        draw, (MARGIN, 556, 494, 736),
+        "CLIMATE", BLUE,
+        "COP31 runs into overtime over fossil fuels",
+        "Draft drops every mention of fossil fuels; talks get an "
+        "extra day.",
+        "ANTALYA, TURKEY", icon_globe,
+    )
+    story_card(
+        draw, (530, 556, PAGE_W - MARGIN, 736),
+        "CYBER", PURPLE,
+        "FBI crime database hacked, CNN reports",
+        "National Crime Information Center breached; second FBI hack "
+        "in months.",
+        "WASHINGTON, USA", icon_lock,
+    )
+
+    band_card(
+        draw, (MARGIN, 748, PAGE_W - MARGIN, 852),
+        "MISSILE", GREEN,
+        "Saudi defences down three Houthi missiles",
+        "Third straight night of alerts over Riyadh; no casualties "
+        "reported.",
+        "RIYADH, SAUDI ARABIA", icon_shield,
+    )
+
+    also_today(draw, 864, 950)
+    footer(draw)
+    return img
 
 
 def main():
-    img = Image.new("RGB", (W, H), PAPER)
-    d = ImageDraw.Draw(img)
-
-    # ---- masthead ----
-    d.rectangle([0, 0, W, 118], fill=NAVY)
-    d.text((32, 18), "THE WORLD IN ONE DAY", font=load(BOLD, 21),
-           fill=NAVY_SOFT)
-    d.text((32, 46), "21 NOVEMBER 2026", font=load(BOLD, 54),
-           fill=(255, 255, 255))
-    d.text((W - 32, 22), "SATURDAY", font=load(BOLD, 30), fill=AMBER,
-           anchor="ra")
-    d.text((W - 32, 60), "KYIV \u00b7 WARSAW \u00b7 NEW YORK \u00b7 BRUSSELS",
-           font=load(BOLD, 15), fill=NAVY_SOFT, anchor="ra")
-    d.rectangle([0, 118, W, 124], fill=CRIMSON)
-
-    # ---- story grid: 2 columns x 3 rows ----
-    gx, gy = 16, 140
-    bw, bh, gap = 488, 232, 12
-    for i, story in enumerate(STORIES):
-        x = gx + (i % 2) * (bw + gap)
-        y = gy + (i // 2) * (bh + gap)
-        draw_card(d, story, x, y, bw, bh)
-
-    # ---- "also today" strip, three lines ----
-    ay = gy + 3 * bh + 2 * gap + 12
-    d.rounded_rectangle([16, ay, W - 16, ay + 96], radius=10, fill=CARD,
-                        outline=EDGE, width=1)
-    f_also = load(REG, 17)
-    f_also_b = load(BOLD, 17)
-    lead = "ALSO TODAY \u2014 "
-    lead_w = f_also_b.getlength(lead)
-    joined = " \u00b7 ".join(ALSO_TODAY)
-    lines = wrap_text(joined, f_also, W - 32 - lead_w - 16)[:3]
-    d.text((32, ay + 8), lead, font=f_also_b, fill=INK)
-    d.text((32 + lead_w, ay + 8), lines[0], font=f_also, fill=INK)
-    if len(lines) > 1:
-        d.text((32, ay + 34), lines[1], font=f_also, fill=INK)
-    if len(lines) > 2:
-        d.text((32, ay + 60), lines[2], font=f_also, fill=INK)
-
-    # ---- footer ----
-    fy = ay + 96 + 8
-    d.rectangle([0, fy, W, H], fill=NAVY)
-    d.text((32, fy + 5), "21 NOVEMBER 2026", font=load(BOLD, 20),
-           fill=(255, 255, 255))
-    d.text((32, fy + 27),
-           "Sources: Reuters \u00b7 Associated Press \u00b7 CNN \u00b7 BBC News \u00b7 "
-           "Al Jazeera \u00b7 AP",
-           font=load(REG, 14), fill=NAVY_SOFT)
-
-    img.save(OUT, optimize=True)
-    print("saved", OUT, img.size)
+    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "news.png")
+    image = build()
+    assert image.size == (PAGE_W, PAGE_H), image.size
+    image.save(out, format="PNG")
+    print("wrote", out, image.size)
 
 
 if __name__ == "__main__":
