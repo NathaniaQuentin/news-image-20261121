@@ -1,68 +1,69 @@
-// Round-3 entry for "Sum up 21 November's world news in one image".
-// Node 22, standard library only. It runs render.py (Pillow) beside
-// this file, which draws news.png (1024x1024), then copies it to the
-// grader's output directory as entry.png — the one file the gate reads.
+// News-image round 4: publish the pre-rendered front page.
 //
-// Round-3 fix: the grader mounts the repository read-only at /bot, so
-// rendering into the script's own directory (round 2) failed with
-// "OSError: [Errno 30] Read-only file system: '/bot/news.png'" and the
-// run exited 1. The renderer now writes to the writable temp directory
-// instead; only the final copy goes to $MAKEFUN_OUTPUT_DIR.
+// news.png sits beside this file in the repository, already drawn.
+// This program only copies it into the grader's output directory as
+// entry.png. Nothing is rendered here: the grader runs with the
+// standard library only and no third-party packages are installed,
+// so a Python/Pillow render step cannot work there — the copy-only
+// shape is the one the competition's own starter uses.
 //
-// Local run:  mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// The output directory is a mount the grader provides, so it is never
+// removed — only the files inside it are cleared before the copy.
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-// The repo is read-only in the grader, so render into the temp dir.
-const rendered = join(tmpdir(), 'news-image-20261121-rendered.png');
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+const sourcePath = join(here, "news.png");
+const destPath = join(outDir, "entry.png");
 
-// The gate takes a whole PNG of at most 1 MiB and 1024 by 1024 pixels.
-const MAX_BYTES = 1_048_576;
+// The gate accepts one PNG of at most 1 MiB and 1024 by 1024 pixels.
+const MAX_BYTES = 1024 * 1024;
+const MAX_SIDE = 1024;
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-function runRenderer() {
-  for (const python of ['python3', 'python']) {
-    try {
-      execFileSync(python, [join(here, 'render.py'), rendered], {
-        cwd: here,
-        stdio: 'inherit',
-      });
-      return;
-    } catch (err) {
-      if (err.code !== 'ENOENT') throw err;
-    }
-  }
-  throw new Error('no python3 or python on PATH to run render.py');
+const image = readFileSync(sourcePath);
+
+if (image.length < 24 || !image.subarray(0, 8).equals(PNG_SIGNATURE)) {
+  throw new Error("news.png is not a PNG file");
+}
+if (image.length > MAX_BYTES) {
+  throw new Error(`news.png is ${image.length} bytes, over the 1 MiB cap`);
 }
 
-function pngSize(path) {
-  // PNG signature (8 bytes) + IHDR chunk: width and height are the
-  // first two big-endian uint32s of the IHDR data, at offsets 16/20.
-  const buf = readFileSync(path);
-  if (buf.length < 24 || buf.readUInt32BE(12) !== 0x49484452) {
-    throw new Error(`${path} is not a PNG file`);
-  }
-  return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+// The first chunk of a PNG is IHDR; its data starts with the width and
+// height as big-endian 32-bit numbers at offsets 16 and 20. Check the
+// chunk tag too (bytes 12-15 spell "IHDR"), so a non-PNG file that
+// happens to start with the right magic cannot slip past with garbage
+// dimensions.
+if (image.readUInt32BE(12) !== 0x49484452) {
+  throw new Error("news.png has no IHDR chunk where one is expected");
+}
+const width = image.readUInt32BE(16);
+const height = image.readUInt32BE(20);
+if (width > MAX_SIDE || height > MAX_SIDE) {
+  throw new Error(`news.png is ${width}x${height}, over the 1024x1024 cap`);
 }
 
-runRenderer();
-
-if (!existsSync(rendered)) {
-  throw new Error(`render.py did not produce ${rendered}`);
-}
-const { width, height } = pngSize(rendered);
-if (width !== 1024 || height !== 1024) {
-  throw new Error(`rendered image is ${width}x${height}, expected 1024x1024`);
-}
-if (statSync(rendered).size > MAX_BYTES) {
-  throw new Error(`rendered image exceeds the 1 MiB gate`);
-}
-
+// Make sure the output directory exists, then empty it without
+// deleting it, and place the image there.
 mkdirSync(outDir, { recursive: true });
-copyFileSync(rendered, join(outDir, 'entry.png'));
-console.log(`wrote ${join(outDir, 'entry.png')} (${width}x${height})`);
+for (const entry of readdirSync(outDir)) {
+  rmSync(join(outDir, entry), { recursive: true, force: true });
+}
+copyFileSync(sourcePath, destPath);
+
+// A broken or partial copy must fail loudly: the published file has to
+// be the same size as the source and hash exactly like it before we
+// report success.
+if (statSync(destPath).size !== image.length) {
+  throw new Error("entry.png size does not match news.png after copy");
+}
+const sha256 = (buf) => createHash("sha256").update(buf).digest("hex");
+if (sha256(readFileSync(destPath)) !== sha256(image)) {
+  throw new Error("entry.png does not match news.png after copy");
+}
+console.log(`wrote entry.png (${image.length} bytes, ${width}x${height} PNG)`);
